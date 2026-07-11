@@ -584,6 +584,60 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 
     const finalStatus = await getAltchaStatus(page);
     console.log(`[${stageName}] 检测到 ALTCHA，但在 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒内未能通过验证。最终状态: ${formatAltchaStatus(finalStatus)}`);
+  return false;
+}
+
+async function openSeeLinkWithRetry(page) {
+    const attempts = [
+        {
+            name: '当前页面',
+            prepare: async () => {
+                await page.waitForTimeout(5000);
+            },
+            timeout: 30000,
+        },
+        {
+            name: '等待登录跳转',
+            prepare: async () => {
+                try {
+                    await page.waitForLoadState('networkidle', { timeout: 20000 });
+                } catch (e) { }
+            },
+            timeout: 30000,
+        },
+        {
+            name: 'dashboard 页面',
+            prepare: async () => {
+                await page.goto('https://dashboard.katabump.com/dashboard', {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 60000,
+                });
+            },
+            timeout: 30000,
+        },
+        {
+            name: '刷新后的 dashboard 页面',
+            prepare: async () => {
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+            },
+            timeout: 30000,
+        },
+    ];
+
+    for (const attempt of attempts) {
+        try {
+            await attempt.prepare();
+            const seeLink = page.getByRole('link', { name: 'See' }).first();
+            await seeLink.waitFor({ timeout: attempt.timeout });
+            await page.waitForTimeout(1000);
+            await seeLink.click();
+            console.log(`已在${attempt.name}找到并点击 "See" 链接。`);
+            return true;
+        } catch (e) {
+            console.log(`未在${attempt.name}找到 "See" 按钮。`);
+        }
+    }
+
     return false;
 }
 
@@ -748,11 +802,8 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
             }
 
             console.log('正在寻找 "See" 链接...');
-            try {
-                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
-                await page.waitForTimeout(1000);
-                await page.getByRole('link', { name: 'See' }).first().click();
-            } catch (e) {
+            const seeOpened = await openSeeLinkWithRetry(page);
+            if (!seeOpened) {
                 console.log('未找到 "See" 按钮。');
                 continue;
             }
