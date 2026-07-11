@@ -314,6 +314,92 @@ async function attemptTurnstileCdp(page) {
     return false;
 }
 
+async function waitForCloudflareSuccess(page, timeoutMs = 15000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        for (const frame of page.frames()) {
+            if (!frame.url().includes('cloudflare')) continue;
+            try {
+                if (await frame.getByText('Success!', { exact: false }).isVisible({ timeout: 300 })) {
+                    return true;
+                }
+            } catch (e) { }
+        }
+        await page.waitForTimeout(1000);
+    }
+    return false;
+}
+
+async function solveLoginTurnstile(page, maxAttempts = 45) {
+    console.log('   >> 正在检查登录 Turnstile (使用 CDP 绕过)...');
+    for (let findAttempt = 0; findAttempt < maxAttempts; findAttempt++) {
+        const cdpClickResult = await attemptTurnstileCdp(page);
+        if (cdpClickResult) {
+            console.log('   >> 登录 CDP 点击生效。正在等待 Cloudflare 成功标志...');
+            if (await waitForCloudflareSuccess(page, 15000)) {
+                console.log('   >> 登录 Turnstile 验证成功。');
+                return true;
+            }
+            console.log('   >> 未观察到 Cloudflare 成功标志，继续重试...');
+        }
+
+        try {
+            const altchaStatus = await getAltchaStatus(page);
+            if (altchaStatus.solved) {
+                console.log('   >> 登录验证已通过。');
+                return true;
+            }
+        } catch (e) { }
+
+        await page.waitForTimeout(1000);
+    }
+    console.log('   >> 登录 Turnstile 未检测到或未通过。');
+    return false;
+}
+
+async function waitForLoginResult(page, timeoutMs = 60000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        try {
+            if (await page.getByRole('link', { name: 'See' }).first().isVisible({ timeout: 1000 })) {
+                return 'see';
+            }
+        } catch (e) { }
+
+        if (page.url().includes('/dashboard')) {
+            return 'dashboard';
+        }
+
+        try {
+            if (await page.getByText('Incorrect password or no account').isVisible({ timeout: 500 })) {
+                return 'bad_credentials';
+            }
+        } catch (e) { }
+
+        await solveLoginTurnstile(page, 3);
+        await page.waitForTimeout(1000);
+    }
+    return 'timeout';
+}
+
+async function saveLoginDebug(page, user, reason) {
+    console.log(`登录诊断: reason=${reason}, url=${page.url()}`);
+    try {
+        console.log(`登录诊断标题: ${await page.title()}`);
+    } catch (e) { }
+
+    const photoDir = path.join(process.cwd(), 'screenshots');
+    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+    const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+    const screenshotPath = path.join(photoDir, `${safeUser}_login_${reason}.png`);
+    try {
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`登录诊断截图已保存: ${screenshotPath}`);
+    } catch (e) {
+        console.log('登录诊断截图失败:', e.message);
+    }
+}
+
 // --- 辅助函数：通过 CDP 派发鼠标点击事件 ---
 async function dispatchCdpClick(page, x, y) {
     const client = await page.context().newCDPSession(page);
@@ -744,46 +830,17 @@ async function openSeeLinkWithRetry(page) {
                 await page.waitForTimeout(500);
 
                 // --- Cloudflare Turnstile Bypass for Login ---
-                console.log('   >> 正在登录前检查 Turnstile (使用 CDP 绕过)...');
-                let cdpClickResult = false;
-                for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
-                    cdpClickResult = await attemptTurnstileCdp(page);
-                    if (cdpClickResult) break;
-                    await page.waitForTimeout(1000);
-                }
-
-                if (cdpClickResult) {
-                    console.log('   >> 登录 CDP 点击生效。正在等待最多 10秒 Cloudflare 成功标志...');
-                    for (let waitSec = 0; waitSec < 10; waitSec++) {
-                        const frames = page.frames();
-                        let isSuccess = false;
-                        for (const f of frames) {
-                            if (f.url().includes('cloudflare')) {
-                                try {
-                                    if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                        isSuccess = true;
-                                        break;
-                                    }
-                                } catch (e) { }
-                            }
-                        }
-                        if (isSuccess) {
-                            console.log('   >> 登录前 Turnstile 验证成功。');
-                            break;
-                        }
-                        await page.waitForTimeout(1000);
-                    }
-                } else {
-                    console.log('   >> 登录前未检测到或未点击 Turnstile，继续操作...');
-                }
+                await solveLoginTurnstile(page, 45);
                 // --------------------------------------------
 
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
+                const loginResult = await waitForLoginResult(page, 60000);
+                console.log(`   >> 登录后等待结果: ${loginResult}`);
 
                 // User Request: Check for incorrect password
                 try {
                     const errorMsg = page.getByText('Incorrect password or no account');
-        if (await errorMsg.isVisible({ timeout: 3000 })) {
+        if (loginResult === 'bad_credentials' || await errorMsg.isVisible({ timeout: 3000 })) {
           console.error(` >> ❌ 登录失败: 用户 ${user.username} 账号或密码错误`);
           const failPhotoDir = path.join(process.cwd(), 'screenshots');
           if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
@@ -797,8 +854,13 @@ async function openSeeLinkWithRetry(page) {
                     }
                 } catch (e) { }
 
+                if (loginResult === 'timeout') {
+                    await saveLoginDebug(page, user, loginResult);
+                }
+
             } catch (e) {
                 console.log('登录错误:', e.message);
+                await saveLoginDebug(page, user, 'error');
             }
 
             console.log('正在寻找 "See" 链接...');
