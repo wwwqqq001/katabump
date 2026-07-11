@@ -330,13 +330,14 @@ async function waitForCloudflareSuccess(page, timeoutMs = 15000) {
     return false;
 }
 
-async function solveLoginTurnstile(page, maxAttempts = 45) {
+async function solveLoginTurnstile(page, maxAttempts = 45, maxTotalMs = 45000, successWaitMs = 8000) {
     console.log('   >> 正在检查登录 Turnstile (使用 CDP 绕过)...');
-    for (let findAttempt = 0; findAttempt < maxAttempts; findAttempt++) {
+    const startedAt = Date.now();
+    for (let findAttempt = 0; findAttempt < maxAttempts && Date.now() - startedAt < maxTotalMs; findAttempt++) {
         const cdpClickResult = await attemptTurnstileCdp(page);
         if (cdpClickResult) {
             console.log('   >> 登录 CDP 点击生效。正在等待 Cloudflare 成功标志...');
-            if (await waitForCloudflareSuccess(page, 15000)) {
+            if (await waitForCloudflareSuccess(page, successWaitMs)) {
                 console.log('   >> 登录 Turnstile 验证成功。');
                 return true;
             }
@@ -353,7 +354,7 @@ async function solveLoginTurnstile(page, maxAttempts = 45) {
 
         await page.waitForTimeout(1000);
     }
-    console.log('   >> 登录 Turnstile 未检测到或未通过。');
+    console.log(`   >> 登录 Turnstile 未检测到或未通过，用时 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒。`);
     return false;
 }
 
@@ -376,7 +377,7 @@ async function waitForLoginResult(page, timeoutMs = 60000) {
             }
         } catch (e) { }
 
-        await solveLoginTurnstile(page, 3);
+        await solveLoginTurnstile(page, 2, 10000, 3000);
         await page.waitForTimeout(1000);
     }
     return 'timeout';
