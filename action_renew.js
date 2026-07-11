@@ -3,46 +3,163 @@ const stealth = require('puppeteer-extra-plugin-stealth')();
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const { spawn, exec } = require('child_process');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 const http = require('http');
 
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
-const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const GITHUB_EVENT_NAME = process.env.GITHUB_EVENT_NAME || '';
+const DEFAULT_CALLBACK_URL = 'https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin';
+const JOB_ID = process.env.JOB_ID || 'katabump-renew';
+const RUN_ID = process.env.RUN_ID || `local_${Date.now()}`;
+const CALLBACK_URL = process.env.CALLBACK_URL || DEFAULT_CALLBACK_URL;
+const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
 
 // Anti-detection: scheduled runs get 0-3h random delay; manual runs skip delay
 const SINGBOX_LOCAL_PROXY = 'http://127.0.0.1:8080';
 
 async function sendTelegramMessage(message, imagePath = null) {
-    if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+    console.log('[Notify] Direct notification disabled; result will be sent by platform webhook.');
+}
 
-    // 1. 发送文字消息
-    try {
-        const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-        await axios.post(url, {
-            chat_id: TG_CHAT_ID,
-            text: message,
-            parse_mode: 'Markdown'
-        });
-        console.log('[Telegram] Message sent.');
-    } catch (e) {
-        console.error('[Telegram] Failed to send message:', e.message);
+function maskAccount(value = '') {
+    const raw = String(value);
+    if (!raw) return 'unknown';
+    const [name, domain] = raw.split('@');
+    const maskedName = name.length <= 4
+        ? `${name.slice(0, 1)}***`
+        : `${name.slice(0, 2)}***${name.slice(-2)}`;
+    if (!domain) return maskedName;
+    const domainParts = domain.split('.');
+    const domainHead = domainParts[0] || '';
+    const maskedDomain = domainHead.length <= 2
+        ? `${domainHead.slice(0, 1)}***`
+        : `${domainHead.slice(0, 2)}***`;
+    return `${maskedName}@${maskedDomain}`;
+}
+
+function accountId(value = '') {
+    return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
+}
+
+function createAccountResult(user, status, success, note = '') {
+    return {
+        account_id: accountId(user && user.username),
+        name: maskAccount(user && user.username),
+        status,
+        success,
+        reward: {
+            points: 0,
+            space_mb: 0,
+            items: [],
+            text: success ? '+0' : '',
+        },
+        balance: {
+            points: 0,
+            value_cny: 0,
+            days_remaining: 0,
+            personal_quota: '',
+            family_quota: '',
+            text: '',
+        },
+        note,
+        roles: [],
+    };
+}
+
+function summarizeAccounts(accounts) {
+    return accounts.reduce((summary, account) => {
+        if (account.status === '跳过') {
+            summary.skipped += 1;
+        } else if (account.success) {
+            summary.success += 1;
+        } else {
+            summary.failed += 1;
+        }
+        return summary;
+    }, {
+        success: 0,
+        failed: 0,
+        duplicate: 0,
+        skipped: 0,
+        warning: 0,
+    });
+}
+
+function buildDetailsMarkdown(accounts) {
+    if (accounts.length === 0) return 'Katabump：失败1\n- 未产生账号结果';
+    const summary = summarizeAccounts(accounts);
+    const headlineParts = [];
+    if (summary.success) headlineParts.push(`成功${summary.success}`);
+    if (summary.failed) headlineParts.push(`失败${summary.failed}`);
+    if (summary.skipped) headlineParts.push(`跳过${summary.skipped}`);
+    if (headlineParts.length === 0) headlineParts.push('无结果');
+    const lines = [`Katabump：${headlineParts.join('，')}`];
+    for (const account of accounts) {
+        const note = account.note ? `，${account.note}` : '';
+        lines.push(`- ${account.name}：${account.status}${note}`);
+    }
+    return lines.join('\n');
+}
+
+function errorCodeFromMessage(message = '') {
+    const text = String(message).toLowerCase();
+    if (text.includes('incorrect password') || text.includes('账号或密码')) return 'AUTH_REQUIRED';
+    if (text.includes('token')) return 'TOKEN_INVALID';
+    if (text.includes('proxy') || text.includes('timeout') || text.includes('timed out') || text.includes('network')) return 'NETWORK_TIMEOUT';
+    if (text.includes('config') || text.includes('users_json') || text.includes('http_proxy')) return 'CONFIG_INVALID';
+    return 'UNKNOWN_ERROR';
+}
+
+function isRetryableError(errorCode) {
+    return !['AUTH_REQUIRED', 'COOKIE_EXPIRED', 'TOKEN_INVALID', 'CONFIG_INVALID'].includes(errorCode);
+}
+
+function buildPlatformPayload(accounts, topLevelError = null) {
+    const summary = summarizeAccounts(accounts);
+    const hasFailed = summary.failed > 0 || !!topLevelError;
+    if (topLevelError && summary.failed === 0) summary.failed = 1;
+    const message = hasFailed
+        ? `成功${summary.success}，失败${summary.failed}，跳过${summary.skipped}`
+        : `成功${summary.success}，失败0，跳过${summary.skipped}`;
+    const payload = {
+        job_id: JOB_ID,
+        run_id: RUN_ID,
+        source: 'github_actions',
+        status: hasFailed ? 'failed' : 'success',
+        title: hasFailed ? 'Katabump 续期失败' : 'Katabump 续期完成',
+        message,
+        data: {
+            summary,
+            accounts,
+            roles: [],
+            details_markdown: buildDetailsMarkdown(accounts),
+        },
+    };
+
+    if (hasFailed) {
+        const failedAccount = accounts.find((account) => !account.success);
+        const errorSource = topLevelError ? topLevelError.message : (failedAccount && failedAccount.note) || message;
+        const errorCode = errorCodeFromMessage(errorSource);
+        payload.retryable = isRetryableError(errorCode);
+        payload.error_code = errorCode;
     }
 
-    // 2. 发送图片 (如果有)
-    if (imagePath && fs.existsSync(imagePath)) {
-        console.log('[Telegram] Sending photo...');
-        // 使用 curl 发送图片，避免引入额外的 multipart 依赖
-        // 注意：Windows 本地测试可能需要环境支持 curl，GitHub Actions (Ubuntu) 默认支持
-        const cmd = `curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" -F chat_id="${TG_CHAT_ID}" -F photo="@${imagePath}"`;
-        await new Promise(resolve => {
-            exec(cmd, (err) => {
-                if (err) console.error('[Telegram] Failed to send photo via curl:', err.message);
-                else console.log('[Telegram] Photo sent.');
-                resolve();
-            });
-        });
+    return payload;
+}
+
+async function sendPlatformWebhook(payload) {
+    if (!WEBHOOK_TOKEN) {
+        throw new Error('CONFIG_INVALID: WEBHOOK_TOKEN is required');
     }
+    await axios.post(CALLBACK_URL, payload, {
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Webhook-Token': WEBHOOK_TOKEN,
+        },
+        timeout: 30000,
+        validateStatus: (status) => status >= 200 && status < 300,
+    });
+    console.log(`[Webhook] Sent result to ${CALLBACK_URL}`);
 }
 
 // 启用 stealth 插件
@@ -94,7 +211,7 @@ async function resolveProxyConfig() {
       console.log(`[Proxy] HTTP_PROXY detected: server=${PROXY_CONFIG.server}, auth=${PROXY_CONFIG.username ? 'Yes' : 'No'}`);
     } catch (e) {
       console.error('[Proxy] Invalid HTTP_PROXY format. Expected: http://user:pass@host:port or http://host:port');
-      process.exit(1);
+      throw new Error('CONFIG_INVALID: invalid HTTP_PROXY format');
     }
   }
 }
@@ -391,7 +508,7 @@ async function saveLoginDebug(page, user, reason) {
 
     const photoDir = path.join(process.cwd(), 'screenshots');
     if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-    const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+    const safeUser = accountId(user.username);
     const screenshotPath = path.join(photoDir, `${safeUser}_login_${reason}.png`);
     try {
         await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -728,7 +845,17 @@ async function openSeeLinkWithRetry(page) {
     return false;
 }
 
-(async () => {
+async function main() {
+  const accountResults = [];
+  let browser;
+  const recordAccount = (user, status, success, note = '') => {
+    const result = createAccountResult(user, status, success, note);
+    accountResults.push(result);
+    console.log(`[Result] ${result.name}: ${status}${note ? ` - ${note}` : ''}`);
+    return result;
+  };
+
+  try {
   // Random delay for scheduled runs (anti-detection)
   if (GITHUB_EVENT_NAME === 'schedule') {
     const maxDelaySec = 3 * 60 * 60;
@@ -745,7 +872,7 @@ async function openSeeLinkWithRetry(page) {
   const users = getUsers();
   if (users.length === 0) {
     console.log('未在 process.env.USERS_JSON 中找到用户');
-    process.exit(1);
+    throw new Error('CONFIG_INVALID: USERS_JSON is empty');
   }
 
   await resolveProxyConfig();
@@ -754,14 +881,13 @@ async function openSeeLinkWithRetry(page) {
         const isValid = await checkProxy();
         if (!isValid) {
             console.error('[代理] 代理无效，终止运行。');
-            process.exit(1);
+            throw new Error('NETWORK_TIMEOUT: proxy validation failed');
         }
     }
 
     await launchChrome();
 
     console.log(`正在连接 Chrome...`);
-    let browser;
     for (let k = 0; k < 5; k++) {
         try {
             browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
@@ -775,7 +901,7 @@ async function openSeeLinkWithRetry(page) {
 
     if (!browser) {
         console.error('连接失败。退出。');
-        process.exit(1);
+        throw new Error('NETWORK_TIMEOUT: failed to connect Chrome');
     }
 
     const context = browser.contexts()[0];
@@ -797,6 +923,11 @@ async function openSeeLinkWithRetry(page) {
 
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
+        let userResultRecorded = false;
+        const recordUser = (status, success, note = '') => {
+            userResultRecorded = true;
+            return recordAccount(user, status, success, note);
+        };
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`); // 隐去具体邮箱 logging
 
         try {
@@ -842,32 +973,38 @@ async function openSeeLinkWithRetry(page) {
                 try {
                     const errorMsg = page.getByText('Incorrect password or no account');
         if (loginResult === 'bad_credentials' || await errorMsg.isVisible({ timeout: 3000 })) {
-          console.error(` >> ❌ 登录失败: 用户 ${user.username} 账号或密码错误`);
+          console.error(` >> ❌ 登录失败: 用户 ${maskAccount(user.username)} 账号或密码错误`);
           const failPhotoDir = path.join(process.cwd(), 'screenshots');
           if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
-          const failSafeName = user.username.replace(/[^a-z0-9]/gi, '_');
+          const failSafeName = accountId(user.username);
           const failShotPath = path.join(failPhotoDir, `${failSafeName}_login_fail.png`);
           try { await page.screenshot({ path: failShotPath, fullPage: true }); } catch (e) { }
 
           await sendTelegramMessage(`❌ *登录失败*\n用户: ${user.username}\n原因: 账号或密码错误`, failShotPath);
 
+                        recordUser('失败', false, '账号或密码错误');
                         continue;
                     }
                 } catch (e) { }
 
                 if (loginResult === 'timeout') {
                     await saveLoginDebug(page, user, loginResult);
+                    recordUser('失败', false, '登录超时');
+                    continue;
                 }
 
             } catch (e) {
                 console.log('登录错误:', e.message);
                 await saveLoginDebug(page, user, 'error');
+                recordUser('失败', false, `登录异常: ${e.message}`);
+                continue;
             }
 
             console.log('正在寻找 "See" 链接...');
             const seeOpened = await openSeeLinkWithRetry(page);
             if (!seeOpened) {
                 console.log('未找到 "See" 按钮。');
+                recordUser('失败', false, '登录后未找到 See 入口');
                 continue;
             }
 
@@ -958,7 +1095,7 @@ async function openSeeLinkWithRetry(page) {
                         const path = require('path');
                         const photoDir = path.join(process.cwd(), 'screenshots');
                         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                        const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+                        const safeUser = accountId(user.username);
                         const tsScreenshotName = `${safeUser}_Turnstile_${attempt}.png`;
                         try {
                             await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
@@ -993,12 +1130,13 @@ async function openSeeLinkWithRetry(page) {
                                     const path = require('path');
                                     const photoDir = path.join(process.cwd(), 'screenshots');
                                     if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                                    const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+                                    const safeUser = accountId(user.username);
                                     const skipShotPath = path.join(photoDir, `${safeUser}_skip.png`);
                                     try { await page.screenshot({ path: skipShotPath, fullPage: true }); } catch (e) { }
 
                                     await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
 
+                                    recordUser('跳过', true, `暂无法续期，下次可用 ${dateStr}`);
                                     renewSuccess = true; // Mark as done to stop retries
                                     try {
                                         const closeBtn = modal.getByLabel('Close');
@@ -1029,11 +1167,12 @@ async function openSeeLinkWithRetry(page) {
                             const path = require('path');
                             const photoDir = path.join(process.cwd(), 'screenshots');
                             if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                            const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+                            const safeUser = accountId(user.username);
                             const successShotPath = path.join(photoDir, `${safeUser}_success.png`);
                             try { await page.screenshot({ path: successShotPath, fullPage: true }); } catch (e) { }
 
                             await sendTelegramMessage(`✅ *续期成功*\n用户: ${user.username}\n状态: 服务器已成功续期！`, successShotPath);
+                            recordUser('续期成功', true, '服务器已成功续期');
                             renewSuccess = true;
                             break;
                         } else {
@@ -1051,11 +1190,18 @@ async function openSeeLinkWithRetry(page) {
 
                 } else {
                     console.log('未找到 Renew 按钮 (服务器可能已续期或页面加载错误)。');
+                    recordUser('跳过', true, '未找到 Renew 按钮，可能已经续期');
                     break;
                 }
             }
+            if (!userResultRecorded) {
+                recordUser(renewSuccess ? '续期成功' : '失败', renewSuccess, renewSuccess ? '续期流程完成' : '续期流程未确认成功');
+            }
         } catch (err) {
             console.error(`Error processing user:`, err);
+            if (!userResultRecorded) {
+                recordUser('失败', false, err.message || '账号处理异常');
+            }
         }
 
         // Snapshot before handling next user
@@ -1065,7 +1211,7 @@ async function openSeeLinkWithRetry(page) {
         const photoDir = path.join(process.cwd(), 'screenshots');
         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
         // Use safe filename
-        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
+        const safeUsername = accountId(user.username);
         const screenshotPath = path.join(photoDir, `${safeUsername}.png`);
         try {
             await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -1078,6 +1224,26 @@ async function openSeeLinkWithRetry(page) {
     }
 
     console.log('完成。');
-    await browser.close();
-    process.exit(0);
-})();
+    if (browser) {
+        await browser.close().catch((e) => console.log('关闭浏览器失败:', e.message));
+    }
+
+    const payload = buildPlatformPayload(accountResults);
+    await sendPlatformWebhook(payload);
+    process.exit(payload.status === 'failed' ? 1 : 0);
+  } catch (err) {
+    console.error('[Fatal]', err.message || err);
+    if (browser) {
+        await browser.close().catch((e) => console.log('关闭浏览器失败:', e.message));
+    }
+    const payload = buildPlatformPayload(accountResults, err);
+    try {
+        await sendPlatformWebhook(payload);
+    } catch (webhookErr) {
+        console.error('[Webhook] Failed to send failure payload:', webhookErr.message);
+    }
+    process.exit(1);
+  }
+}
+
+main();

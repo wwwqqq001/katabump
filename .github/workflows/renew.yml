@@ -1,10 +1,17 @@
 name: Katabump Auto Renew
 
 on:
-  schedule:
-  # 每天 UTC 0点 (北京时间 8点) 运行
-  - cron: '0 0 * * *'
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+        type: string
+      run_id:
+        required: true
+        type: string
+      callback_url:
+        required: false
+        type: string
 
 jobs:
   renew:
@@ -56,8 +63,10 @@ jobs:
         USERS_JSON: ${{ secrets.USERS_JSON }}
         HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
         PROXY_URL: ${{ secrets.PROXY_URL }}
-        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        JOB_ID: ${{ github.event.inputs.job_id }}
+        RUN_ID: ${{ github.event.inputs.run_id }}
+        CALLBACK_URL: ${{ github.event.inputs.callback_url || 'https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin' }}
+        WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
       run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
 

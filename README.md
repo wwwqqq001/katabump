@@ -1,16 +1,19 @@
 # Katabump Server Auto-Renewal Tool
 
-基于[XCQ0607/katabump](https://github.com/XCQ0607/katabump)优化：增加singbox全协议代理、随机时间签到、**ALTCHA验证码自动绕过**
+基于 [zv201413/katabump](https://github.com/zv201413/katabump) 维护，保留原续期逻辑，并接入 Cloudflare 签到调度平台。GitHub Actions 只支持平台或人工通过 `workflow_dispatch` 触发，不再内置 Cron，也不再直接发送 Telegram 等第三方通知。
 
 
-## 🚀 GitHub Actions 云端运行 (推荐)
+## GitHub Actions 接入调度平台
 
-这是最省心的方式，配置一次即可每天自动执行。
+平台通过 GitHub Actions `workflow_dispatch` 触发续期任务，脚本结束后统一 POST 回调到 Cloudflare 调度平台。
 
 1. **Fork 本仓库** 到你的 GitHub 账号。
 2. 进入你的仓库，点击 **Settings** -> **Secrets and variables** -> **Actions**。
-3. 点击 **New repository secret**，添加一个名为 `USERS_JSON` 的 Secret。
-4. **Value** 的格式必须是 JSON 数组（请尽量压缩为一行）：
+3. 添加以下 Repository Secrets：
+   - `USERS_JSON`：Katabump 账号列表。
+   - `PROXY_URL`：可选，sing-box 代理链接。
+   - `WEBHOOK_TOKEN`：调度平台 webhook 密钥。
+4. `USERS_JSON` 的格式必须是 JSON 数组（请尽量压缩为一行）：
    ```json
    [{"username": "your_email@example.com", "password": "your_password"}, {"username": "another@example.com", "password": "pwd"}]
    ```
@@ -27,22 +30,50 @@
     - hy2: `hy2://password@host:port?sni=xxx`
     - socks5: `socks5://user:pass@host:port`
 
-6. **(可选) Telegram 消息推送**:
-   如果你希望在续期成功、失败或跳过时收到 Telegram 通知（包含截图），请配置以下 Secret：
-   - `TG_BOT_TOKEN`: 你的 Telegram Bot Token (从 @BotFather 获取)。
-   - `TG_CHAT_ID`: 你的 Chat ID (用户 ID 或群组 ID)。
-   > 如果未配置，脚本将跳过发送通知。
+6. Cloudflare 调度平台任务建议配置：
+   - `job_id`: `katabump-renew`
+   - `workflow_id`: `renew.yml`
+   - `ref`: `master`
+   - `callback_url`: `https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin`
 
-### 4. 运行结果与截图
+### workflow_dispatch inputs
+
+```yaml
+job_id:
+  required: true
+  type: string
+run_id:
+  required: true
+  type: string
+callback_url:
+  required: false
+  type: string
+```
+
+如果 `callback_url` 为空，脚本会回退到：
+
+```text
+https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin
+```
+
+### 回调结果
+
+脚本会保留所有账号在同一次 GitHub Actions job 内串行执行，不会按账号拆分 job。结果统一回调：
+
+- `status=success`：所有账号续期成功，或仅存在“未到续期时间”等跳过结果。
+- `status=failed`：至少一个账号登录、页面流程、验证码、代理或配置失败。
+- `data.summary`：包含 `success`、`failed`、`duplicate`、`skipped`、`warning`。
+- `data.accounts`：每个账号包含脱敏 ID、脱敏账号名、状态、奖励、余额、备注和角色数组。
+- `data.details_markdown`：平台通知使用的可读摘要。
+
+### 运行结果与截图
 
 - **运行日志**: 在 Actions 中的 `Run Renew Script` 步骤查看。
 - **截图留存**: 每次运行（无论成功与否），通过 `Upload Screenshots` 步骤自动上传截图。
   - 你可以在 Workflow 运行详情页的 **Artifacts** 区域下载 `screenshots` 压缩包。
-  - 每个账号对应一张截图（`username.png`），方便确认状态。
+  - 截图文件名使用账号 hash，不包含完整邮箱或密码。
 
-5. 保存后，进入 **Actions** 页面，启用 Workflow。它会在**每天北京时间 08:00 (UTC 00:00)** 自动运行。
-6. 你也可以手动点击 "Run workflow" 立即测试。
-7. **随机延迟**: 定时任务触发时，脚本会随机延迟 0-3 小时后执行，防止被目标站识别为自动化。手动触发时不会有延迟，立即执行。
+你也可以在 Actions 页面手动点击 "Run workflow" 测试，但真实平台回调要求 `run_id` 已由平台创建。手动测试时可以临时填入测试回调地址。
 
 ---
 
@@ -129,5 +160,5 @@ node renew.js
 * `renew.js`: Windows 本地运行的主程序。
 * `action_renew.js`: 专门用于 GitHub Actions 环境的脚本（适配 Linux/Headless），支持随机延迟和 sing-box 代理。
 * `proxy_handler.py`: 代理协议解析器，将 vmess/vless/hy2/tuic/socks5 等协议转换为 sing-box 配置。
-* `.github/workflows/renew.yml`: GitHub Actions 的定时任务配置文件。
+* `.github/workflows/renew.yml`: GitHub Actions 手动触发 workflow，由 Cloudflare 调度平台调用。
 * `login.json`: (需手动创建) 存放本地运行的账号信息。
