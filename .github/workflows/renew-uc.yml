@@ -1,0 +1,90 @@
+name: Katabump UC Renew (SeleniumBase)
+
+# Test branch workflow: SeleniumBase UC-mode path (weikkadd-style).
+# Does not replace renew.yml JS path until verified.
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+        type: string
+      run_id:
+        required: true
+        type: string
+      callback_url:
+        required: false
+        type: string
+
+jobs:
+  renew-uc:
+    name: UC renew
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system + python deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
+          python -m pip install -U pip
+          pip install seleniumbase requests
+          seleniumbase install chromedriver
+
+      - name: Start Proxy (sing-box)
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          if [ -z "$PROXY_URL" ]; then
+            echo "PROXY_URL not set, skipping sing-box setup."
+            exit 0
+          fi
+          SINGBOX_VER="1.11.0"
+          echo "Downloading sing-box v${SINGBOX_VER}..."
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          tar -xzf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
+          chmod +x ./sing-box
+          echo "Generating sing-box config from PROXY_URL..."
+          python proxy_handler.py
+          echo "Starting sing-box..."
+          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 3
+          echo "sing-box started."
+          head -n 30 singbox.log || true
+
+      - name: Pre-clean chrome leftovers
+        run: |
+          pkill -9 -f chrome 2>/dev/null || true
+          pkill -9 -f chromedriver 2>/dev/null || true
+          rm -rf /tmp/chrome_user_data 2>/dev/null || true
+          sleep 1
+
+      - name: Run UC renew
+        env:
+          USERS_JSON: ${{ secrets.USERS_JSON }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          KATABUMP_SERVER_ID: ${{ secrets.KATABUMP_SERVER_ID }}
+          KATABUMP_SERVER_IDS: ${{ secrets.KATABUMP_SERVER_IDS }}
+          KATABUMP_TEST_ONLY_USER: ${{ secrets.KATABUMP_TEST_ONLY_USER }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          RUN_ID: ${{ github.event.inputs.run_id }}
+          CALLBACK_URL: ${{ github.event.inputs.callback_url || 'https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin' }}
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 uc_renew.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uc-screenshots
+          path: |
+            *.png
+            screenshots/
+          if-no-files-found: warn
