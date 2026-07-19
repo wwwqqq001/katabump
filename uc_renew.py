@@ -288,6 +288,10 @@ def build_payload(accounts: list[dict[str, Any]], top_error: str | None = None) 
 
 
 def send_webhook(payload: dict[str, Any]) -> None:
+    if str(os.environ.get("SKIP_WEBHOOK", "")).lower() in ("1", "true", "yes"):
+        print("[Webhook] SKIP_WEBHOOK set; print payload only.")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
     if not WEBHOOK_TOKEN:
         print("[Webhook] WEBHOOK_TOKEN missing; print payload only.")
         print(json.dumps(payload, ensure_ascii=False, indent=2))

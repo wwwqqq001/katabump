@@ -453,6 +453,27 @@ async function attemptTurnstileCdp(page) {
     return false;
 }
 
+async function hasTurnstileToken(page) {
+    try {
+        return await page.evaluate(() => {
+            const input = document.querySelector('input[name="cf-turnstile-response"]');
+            return !!(input && input.value && input.value.length > 20);
+        });
+    } catch (e) {
+        return false;
+    }
+}
+
+async function waitForTurnstileToken(page, timeoutMs = 15000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        if (await hasTurnstileToken(page)) return true;
+        if (await waitForCloudflareSuccess(page, 800)) return true;
+        await page.waitForTimeout(500);
+    }
+    return false;
+}
+
 async function waitForCloudflareSuccess(page, timeoutMs = 15000) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
@@ -489,12 +510,19 @@ async function solveLoginTurnstile(page, maxAttempts = 15, maxTotalMs = 20000, s
     }
 
     if (cdpClickResult) {
-        console.log(`   >> 登录 CDP 点击生效。正在等待最多 ${Math.ceil(successWaitMs / 1000)} 秒 Cloudflare 成功标志...`);
-        if (await waitForCloudflareSuccess(page, successWaitMs)) {
-            console.log('   >> 登录前 Turnstile 验证成功。');
+        console.log(`   >> 登录 CDP 点击生效。正在等待最多 ${Math.ceil(successWaitMs / 1000)} 秒 token/Success...`);
+        if (await waitForTurnstileToken(page, successWaitMs) || await waitForCloudflareSuccess(page, successWaitMs)) {
+            console.log('   >> 登录前 Turnstile 验证成功（token/Success）。');
             return true;
         }
-        console.log('   >> 未观察到 Cloudflare 成功标志，仍继续点击 Login（与 XCQ 行为一致）。');
+        // One more click if first click did not produce token.
+        console.log('   >> 首次点击未产出 token，再尝试一次 CDP 点击...');
+        await attemptTurnstileCdp(page);
+        if (await waitForTurnstileToken(page, successWaitMs)) {
+            console.log('   >> 第二次点击后拿到 Turnstile token。');
+            return true;
+        }
+        console.log('   >> 仍未拿到 token/Success，继续点击 Login（可能仍失败 captcha）。');
         return false;
     }
 
