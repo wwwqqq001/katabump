@@ -20,7 +20,7 @@ const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
 const KATABUMP_SERVER_ID = (process.env.KATABUMP_SERVER_ID || '').trim();
 const KATABUMP_SERVER_IDS_RAW = (process.env.KATABUMP_SERVER_IDS || '').trim();
 
-// Anti-detection: scheduled runs get 0-3h random delay; manual runs skip delay
+// Random start delay disabled: always start immediately (schedule and manual).
 const SINGBOX_LOCAL_PROXY = 'http://127.0.0.1:8080';
 
 async function sendTelegramMessage(message, imagePath = null) {
@@ -1121,18 +1121,8 @@ async function main() {
   };
 
   try {
-  // Random delay for scheduled runs (anti-detection)
-  if (GITHUB_EVENT_NAME === 'schedule') {
-    const maxDelaySec = 3 * 60 * 60;
-    const delaySec = Math.floor(Math.random() * maxDelaySec);
-    const hours = Math.floor(delaySec / 3600);
-    const minutes = Math.floor((delaySec % 3600) / 60);
-    const seconds = delaySec % 60;
-    console.log(`[Anti-Detection] Scheduled run: random delay ${hours}h ${minutes}m ${seconds}s...`);
-    await new Promise(r => setTimeout(r, delaySec * 1000));
-  } else {
-    console.log(`[Anti-Detection] Manual/direct run: skipping random delay.`);
-  }
+  // No anti-detection sleep: start work immediately.
+  console.log(`[Anti-Detection] Random delay disabled; starting immediately (event=${GITHUB_EVENT_NAME || 'unknown'}).`);
 
   const users = getUsers();
   if (users.length === 0) {
