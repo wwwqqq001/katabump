@@ -13,6 +13,12 @@ const JOB_ID = process.env.JOB_ID || 'katabump-renew';
 const RUN_ID = process.env.RUN_ID || `local_${Date.now()}`;
 const CALLBACK_URL = process.env.CALLBACK_URL || DEFAULT_CALLBACK_URL;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || '';
+// Optional server navigation helpers:
+// 1) per-user server_id in USERS_JSON
+// 2) KATABUMP_SERVER_IDS JSON map: {"email@x.com":"327725"} or [{"username":"...","server_id":"..."}]
+// 3) KATABUMP_SERVER_ID single global fallback
+const KATABUMP_SERVER_ID = (process.env.KATABUMP_SERVER_ID || '').trim();
+const KATABUMP_SERVER_IDS_RAW = (process.env.KATABUMP_SERVER_IDS || '').trim();
 
 // Anti-detection: scheduled runs get 0-3h random delay; manual runs skip delay
 const SINGBOX_LOCAL_PROXY = 'http://127.0.0.1:8080';
@@ -812,14 +818,153 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
   return false;
 }
 
-async function openSeeLinkWithRetry(page) {
+function loadServerIdMap() {
+    if (!KATABUMP_SERVER_IDS_RAW) return {};
+    try {
+        const parsed = JSON.parse(KATABUMP_SERVER_IDS_RAW);
+        if (Array.isArray(parsed)) {
+            const map = {};
+            for (const item of parsed) {
+                const user = String(item.username || item.email || '').trim().toLowerCase();
+                const id = String(item.server_id || item.serverId || item.id || '').trim();
+                if (user && id) map[user] = id;
+            }
+            return map;
+        }
+        if (parsed && typeof parsed === 'object') {
+            const map = {};
+            for (const [k, v] of Object.entries(parsed)) {
+                const user = String(k || '').trim().toLowerCase();
+                const id = String(v || '').trim();
+                if (user && id) map[user] = id;
+            }
+            return map;
+        }
+    } catch (e) {
+        console.error('解析 KATABUMP_SERVER_IDS 错误:', e.message);
+    }
+    return {};
+}
+
+const SERVER_ID_MAP = loadServerIdMap();
+
+function resolveServerIdForUser(user) {
+    if (!user) return '';
+    const fromUser = String(user.server_id || user.serverId || '').trim();
+    if (fromUser) return fromUser;
+    const email = String(user.username || '').trim().toLowerCase();
+    if (email && SERVER_ID_MAP[email]) return String(SERVER_ID_MAP[email]).trim();
+    if (KATABUMP_SERVER_ID) return KATABUMP_SERVER_ID;
+    return '';
+}
+
+async function dumpDashboardHints(page, tag = 'dashboard') {
+    try {
+        const info = await page.evaluate(() => {
+            const links = Array.from(document.querySelectorAll('a'))
+                .map((a) => ({
+                    text: (a.innerText || a.textContent || '').trim().slice(0, 80),
+                    href: a.getAttribute('href') || '',
+                    aria: a.getAttribute('aria-label') || '',
+                }))
+                .filter((x) => x.href || x.text)
+                .slice(0, 80);
+            const buttons = Array.from(document.querySelectorAll('button'))
+                .map((b) => (b.innerText || b.textContent || '').trim().slice(0, 80))
+                .filter(Boolean)
+                .slice(0, 40);
+            return {
+                url: location.href,
+                title: document.title,
+                bodyText: (document.body && document.body.innerText || '').slice(0, 1500),
+                links,
+                buttons,
+            };
+        });
+        console.log(`[Debug:${tag}] url=${info.url} title=${info.title}`);
+        console.log(`[Debug:${tag}] buttons=`, JSON.stringify(info.buttons));
+        const interesting = info.links.filter((l) =>
+            /server|see|edit|renew|dashboard|manage/i.test(`${l.text} ${l.href} ${l.aria}`)
+        );
+        console.log(`[Debug:${tag}] interestingLinks=`, JSON.stringify(interesting.slice(0, 30)));
+        console.log(`[Debug:${tag}] bodyPreview=\n${info.bodyText}`);
+    } catch (e) {
+        console.log(`[Debug:${tag}] dump failed:`, e.message);
+    }
+}
+
+async function clickServerEntry(page) {
+    // Prefer explicit server edit links over role-name "See" (UI text may change / i18n).
+    const selectors = [
+        'a[href*="/servers/edit?id="]',
+        'a[href*="/servers/edit"]',
+        'td a[href*="/servers/edit"]',
+        'table a[href*="/servers/edit"]',
+        'a[href*="/server"]',
+    ];
+    for (const sel of selectors) {
+        try {
+            const loc = page.locator(sel).first();
+            if (await loc.isVisible({ timeout: 1500 })) {
+                const href = await loc.getAttribute('href');
+                console.log(`找到服务器入口选择器 ${sel}: ${href}`);
+                await loc.click();
+                await page.waitForTimeout(1500);
+                return true;
+            }
+        } catch (e) { }
+    }
+
+    // Role / text based fallbacks
+    const textCandidates = [
+        page.getByRole('link', { name: 'See', exact: true }),
+        page.getByRole('link', { name: /see/i }),
+        page.getByRole('link', { name: /manage|view|details|server/i }),
+        page.locator('a', { hasText: /^\s*See\s*$/i }),
+        page.locator('a', { hasText: /servers\/edit/i }),
+    ];
+    for (const cand of textCandidates) {
+        try {
+            const loc = cand.first();
+            if (await loc.isVisible({ timeout: 1500 })) {
+                console.log('找到服务器入口文本链接，点击中...');
+                await loc.click();
+                await page.waitForTimeout(1500);
+                return true;
+            }
+        } catch (e) { }
+    }
+    return false;
+}
+
+async function openSeeLinkWithRetry(page, user = null) {
+    // If server id is known, skip brittle "See" discovery.
+    const serverId = resolveServerIdForUser(user);
+    if (serverId) {
+        const targetUrl = `https://dashboard.katabump.com/servers/edit?id=${encodeURIComponent(serverId)}`;
+        console.log(`使用 server_id=${serverId} 直达: ${targetUrl}`);
+        try {
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.waitForTimeout(2000);
+            const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+            await renewBtn.waitFor({ state: 'visible', timeout: 15000 });
+            console.log('直达 server edit 页面成功，已看到 Renew 按钮。');
+            return true;
+        } catch (e) {
+            console.log(`直达 server edit 失败: ${e.message}`);
+            await dumpDashboardHints(page, 'server_edit_fail');
+            // Fall through to See/edit discovery.
+        }
+    } else {
+        console.log('未配置 server_id，改为从 dashboard 发现服务器入口。');
+    }
+
     const attempts = [
         {
             name: '当前页面',
             prepare: async () => {
                 await page.waitForTimeout(5000);
             },
-            timeout: 30000,
         },
         {
             name: '等待登录跳转',
@@ -828,7 +973,6 @@ async function openSeeLinkWithRetry(page) {
                     await page.waitForLoadState('networkidle', { timeout: 20000 });
                 } catch (e) { }
             },
-            timeout: 30000,
         },
         {
             name: 'dashboard 页面',
@@ -837,29 +981,59 @@ async function openSeeLinkWithRetry(page) {
                     waitUntil: 'domcontentloaded',
                     timeout: 60000,
                 });
+                await page.waitForTimeout(2000);
             },
-            timeout: 30000,
+        },
+        {
+            name: 'servers 列表页',
+            prepare: async () => {
+                // Some accounts land on empty dashboard; try common servers paths.
+                const candidates = [
+                    'https://dashboard.katabump.com/servers',
+                    'https://dashboard.katabump.com/dashboard/servers',
+                    'https://dashboard.katabump.com/server',
+                ];
+                for (const url of candidates) {
+                    try {
+                        const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                        console.log(`尝试打开 ${url} status=${resp && resp.status()}`);
+                        await page.waitForTimeout(1500);
+                        if (await clickServerEntry(page)) return;
+                    } catch (e) {
+                        console.log(`打开 ${url} 失败: ${e.message}`);
+                    }
+                }
+            },
         },
         {
             name: '刷新后的 dashboard 页面',
             prepare: async () => {
+                await page.goto('https://dashboard.katabump.com/dashboard', {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 60000,
+                });
                 await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
             },
-            timeout: 30000,
         },
     ];
 
     for (const attempt of attempts) {
         try {
             await attempt.prepare();
-            const seeLink = page.getByRole('link', { name: 'See' }).first();
-            await seeLink.waitFor({ timeout: attempt.timeout });
-            await page.waitForTimeout(1000);
-            await seeLink.click();
-            console.log(`已在${attempt.name}找到并点击 "See" 链接。`);
-            return true;
+            if (await clickServerEntry(page)) {
+                console.log(`已在${attempt.name}找到并点击服务器入口。`);
+                // If we landed on list, try one more hop into edit page.
+                const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+                if (!(await renewBtn.isVisible({ timeout: 3000 }).catch(() => false))) {
+                    await clickServerEntry(page);
+                }
+                return true;
+            }
+            console.log(`未在${attempt.name}找到服务器入口。`);
+            await dumpDashboardHints(page, attempt.name);
         } catch (e) {
-            console.log(`未在${attempt.name}找到 "See" 按钮。`);
+            console.log(`未在${attempt.name}找到服务器入口: ${e.message}`);
+            await dumpDashboardHints(page, attempt.name).catch(() => { });
         }
     }
 
@@ -1023,11 +1197,13 @@ async function main() {
                 continue;
             }
 
-            console.log('正在寻找 "See" 链接...');
-            const seeOpened = await openSeeLinkWithRetry(page);
+            console.log('正在寻找服务器入口 ("See" / servers/edit)...');
+            const seeOpened = await openSeeLinkWithRetry(page, user);
             if (!seeOpened) {
-                console.log('未找到 "See" 按钮。');
-                recordUser('失败', false, '登录后未找到 See 入口');
+                console.log('未找到服务器入口。');
+                await dumpDashboardHints(page, 'no_server_entry');
+                await saveLoginDebug(page, user, 'no_see');
+                recordUser('失败', false, '登录后未找到服务器入口(See)');
                 continue;
             }
 

@@ -92,6 +92,8 @@ jobs:
         USERS_JSON: ${{ secrets.USERS_JSON }}
         HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
         PROXY_URL: ${{ github.event.inputs.use_proxy == 'true' && secrets.PROXY_URL || '' }}
+        KATABUMP_SERVER_ID: ${{ secrets.KATABUMP_SERVER_ID }}
+        KATABUMP_SERVER_IDS: ${{ secrets.KATABUMP_SERVER_IDS }}
         JOB_ID: ${{ github.event.inputs.job_id || 'katabump-renew-test' }}
         RUN_ID: ${{ github.event.inputs.run_id || format('manual-{0}', github.run_id) }}
         CALLBACK_URL: ${{ github.event.inputs.callback_url || 'https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin' }}
