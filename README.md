@@ -11,24 +11,28 @@
 2. 进入你的仓库，点击 **Settings** -> **Secrets and variables** -> **Actions**。
 3. 添加以下 Repository Secrets：
    - `USERS_JSON`：Katabump 账号列表。
-   - `PROXY_URL`：可选，sing-box 代理链接。
+   - `PROXY_URL`：推荐。sing-box 代理链接；GitHub 直连常被 Turnstile 拦截，住宅/SOCKS 代理成功率更高。
    - `WEBHOOK_TOKEN`：调度平台 webhook 密钥。
+   - `KATABUMP_SERVER_IDS`（可选）：账号 → 服务器 ID 映射，直达续期页，避免依赖脆弱的 “See” 文案。
+   - `KATABUMP_SERVER_ID`（可选）：全局默认 server_id。
 4. `USERS_JSON` 的格式必须是 JSON 数组（请尽量压缩为一行）：
    ```json
    [{"username": "your_email@example.com", "password": "your_password"}, {"username": "another@example.com", "password": "pwd"}]
    ```
+   也可在账号对象里直接写 `server_id`：
+   ```json
+   [{"username":"a@x.com","password":"pwd","server_id":"335120"}]
+   ```
 5. **(可选) 配置代理**:
 
-  支持两种代理方式：
-
-  **全协议代理 (推荐)**
-  添加名为 `PROXY_URL` 的 Secret，支持 vmess、vless、hy2、tuic、socks5 等所有主流协议。
-  脚本会自动下载 sing-box 并在本地启动 HTTP 代理，无需手动配置。
+  添加名为 `PROXY_URL` 的 Secret，支持 vmess、vless、hy2、tuic、socks5 等。
+  脚本会自动下载 sing-box 并在本地启动 HTTP 代理。
   - **格式示例**:
+    - socks5 标准: `socks5://user:pass@host:port`
+    - socks5 面板简写（已支持）: `socks5://host:port:user:pass`
     - vmess: `vmess://base64EncodedJSON`
     - vless: `vless://uuid@host:port?security=tls&type=ws&...#name`
     - hy2: `hy2://password@host:port?sni=xxx`
-    - socks5: `socks5://user:pass@host:port`
 
 6. Cloudflare 调度平台任务建议配置：
    - `job_id`: `katabump-renew`
@@ -48,6 +52,14 @@ run_id:
 callback_url:
   required: false
   type: string
+use_proxy:
+  required: false
+  type: boolean
+  default: true
+skip_webhook:
+  required: false
+  type: boolean
+  default: false   # 仅手动调试时可设 true
 ```
 
 如果 `callback_url` 为空，脚本会回退到：

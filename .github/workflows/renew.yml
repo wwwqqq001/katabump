@@ -4,15 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        description: Platform job id (optional for manual test)
-        required: false
+        description: Platform job id
+        required: true
         type: string
-        default: katabump-renew-test
       run_id:
-        description: Platform run id (optional for manual test)
-        required: false
+        description: Platform run id
+        required: true
         type: string
-        default: manual-test
       callback_url:
         description: Platform callback URL (optional)
         required: false
@@ -23,10 +21,10 @@ on:
         type: boolean
         default: true
       skip_webhook:
-        description: Skip platform webhook callback (recommended for branch test)
+        description: Skip platform webhook callback (manual debug only)
         required: false
         type: boolean
-        default: true
+        default: false
 
 jobs:
   renew:
@@ -66,7 +64,7 @@ jobs:
         chmod +x ./sing-box
         echo "Generating sing-box config from PROXY_URL..."
         if ! python proxy_handler.py; then
-          echo "::warning::proxy_handler.py failed; continuing WITHOUT proxy so renew can still be tested."
+          echo "::warning::proxy_handler.py failed; continuing WITHOUT proxy."
           exit 0
         fi
         echo "Starting sing-box..."
@@ -94,8 +92,8 @@ jobs:
         PROXY_URL: ${{ github.event.inputs.use_proxy == 'true' && secrets.PROXY_URL || '' }}
         KATABUMP_SERVER_ID: ${{ secrets.KATABUMP_SERVER_ID }}
         KATABUMP_SERVER_IDS: ${{ secrets.KATABUMP_SERVER_IDS }}
-        JOB_ID: ${{ github.event.inputs.job_id || 'katabump-renew-test' }}
-        RUN_ID: ${{ github.event.inputs.run_id || format('manual-{0}', github.run_id) }}
+        JOB_ID: ${{ github.event.inputs.job_id }}
+        RUN_ID: ${{ github.event.inputs.run_id }}
         CALLBACK_URL: ${{ github.event.inputs.callback_url || 'https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin' }}
         WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
         SKIP_WEBHOOK: ${{ github.event.inputs.skip_webhook }}
