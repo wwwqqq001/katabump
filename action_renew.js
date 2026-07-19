@@ -502,16 +502,49 @@ async function solveLoginTurnstile(page, maxAttempts = 15, maxTotalMs = 20000, s
     return false;
 }
 
+function getPathname(url) {
+    try {
+        return new URL(url).pathname || '';
+    } catch (e) {
+        return '';
+    }
+}
+
+function isLoggedInPath(url) {
+    // IMPORTANT: host is dashboard.katabump.com, so url.includes('/dashboard') is ALWAYS true
+    // because of the substring "//dashboard". Always inspect pathname only.
+    const pathname = getPathname(url);
+    if (!pathname || pathname.startsWith('/auth/')) return false;
+    if (pathname === '/dashboard' || pathname.startsWith('/dashboard/')) return true;
+    if (pathname.startsWith('/servers')) return true;
+    if (pathname.startsWith('/server')) return true;
+    return false;
+}
+
+function isLoginPath(url) {
+    const pathname = getPathname(url);
+    return pathname.startsWith('/auth/login') || pathname === '/auth' || pathname.startsWith('/auth/');
+}
+
 async function waitForLoginResult(page, timeoutMs = 60000) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
+        const url = page.url();
+        console.log(`   >> login poll url=${url}`);
+
         try {
-            if (await page.getByRole('link', { name: 'See' }).first().isVisible({ timeout: 1000 })) {
+            if (await page.getByRole('link', { name: 'See' }).first().isVisible({ timeout: 800 })) {
                 return 'see';
             }
         } catch (e) { }
 
-        if (page.url().includes('/dashboard')) {
+        try {
+            if (await page.locator('a[href*="/servers/edit"]').first().isVisible({ timeout: 500 })) {
+                return 'see';
+            }
+        } catch (e) { }
+
+        if (isLoggedInPath(url)) {
             return 'dashboard';
         }
 
@@ -521,7 +554,16 @@ async function waitForLoginResult(page, timeoutMs = 60000) {
             }
         } catch (e) { }
 
-        await solveLoginTurnstile(page, 2, 10000, 3000);
+        try {
+            if (url.includes('error=captcha') || await page.getByText(/captcha|complete the captcha/i).isVisible({ timeout: 300 })) {
+                return 'captcha';
+            }
+        } catch (e) { }
+
+        // Only keep solving turnstile while still on login page.
+        if (isLoginPath(url)) {
+            await solveLoginTurnstile(page, 1, 5000, 3000);
+        }
         await page.waitForTimeout(1000);
     }
     return 'timeout';
@@ -1134,15 +1176,16 @@ async function main() {
                 await page.addInitScript(INJECTED_SCRIPT);
             }
 
-            // --- 登录逻辑 (简略版，逻辑一致) ---
-            if (page.url().includes('dashboard')) {
+            // --- 登录逻辑 ---
+            // Host is dashboard.katabump.com — never use url.includes('dashboard').
+            if (isLoggedInPath(page.url())) {
                 await page.goto('https://dashboard.katabump.com/auth/logout');
                 await page.waitForTimeout(2000);
             }
             // 总是先去登录页
             await page.goto('https://dashboard.katabump.com/auth/login');
             await page.waitForTimeout(2000);
-            if (page.url().includes('dashboard')) {
+            if (isLoggedInPath(page.url())) {
                 // 如果登出没成功，再次登出
                 await page.goto('https://dashboard.katabump.com/auth/logout');
                 await page.waitForTimeout(2000);
@@ -1163,13 +1206,13 @@ async function main() {
                 // --------------------------------------------
 
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
-                const loginResult = await waitForLoginResult(page, 60000);
-                console.log(`   >> 登录后等待结果: ${loginResult}`);
+                const loginResult = await waitForLoginResult(page, 90000);
+                console.log(`   >> 登录后等待结果: ${loginResult} url=${page.url()}`);
 
                 // User Request: Check for incorrect password
                 try {
                     const errorMsg = page.getByText('Incorrect password or no account');
-        if (loginResult === 'bad_credentials' || await errorMsg.isVisible({ timeout: 3000 })) {
+        if (loginResult === 'bad_credentials' || await errorMsg.isVisible({ timeout: 2000 })) {
           console.error(` >> ❌ 登录失败: 用户 ${maskAccount(user.username)} 账号或密码错误`);
           const failPhotoDir = path.join(process.cwd(), 'screenshots');
           if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
@@ -1184,9 +1227,15 @@ async function main() {
                     }
                 } catch (e) { }
 
-                if (loginResult === 'timeout') {
-                    await saveLoginDebug(page, user, loginResult);
-                    recordUser('失败', false, '登录超时');
+                if (loginResult === 'captcha') {
+                    await saveLoginDebug(page, user, 'captcha');
+                    recordUser('失败', false, '登录captcha失败');
+                    continue;
+                }
+
+                if (loginResult === 'timeout' || (loginResult !== 'see' && loginResult !== 'dashboard' && isLoginPath(page.url()))) {
+                    await saveLoginDebug(page, user, loginResult || 'still_login');
+                    recordUser('失败', false, `登录未完成: ${loginResult}`);
                     continue;
                 }
 
