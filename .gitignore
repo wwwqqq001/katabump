@@ -1,0 +1,12 @@
+
+# local probe / cache
+__pycache__/
+*.pyc
+_proxy_probe.json
+login.json
+ChromeData_Katabump/
+screenshots/
+photo/
+config.json
+singbox.log
+sing-box
