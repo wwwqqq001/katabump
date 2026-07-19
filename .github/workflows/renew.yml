@@ -4,14 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       job_id:
-        required: true
-        type: string
-      run_id:
-        required: true
-        type: string
-      callback_url:
+        description: Platform job id (optional for manual test)
         required: false
         type: string
+        default: katabump-renew-test
+      run_id:
+        description: Platform run id (optional for manual test)
+        required: false
+        type: string
+        default: manual-test
+      callback_url:
+        description: Platform callback URL (optional)
+        required: false
+        type: string
+      use_proxy:
+        description: Whether to start sing-box from PROXY_URL
+        required: false
+        type: boolean
+        default: true
+      skip_webhook:
+        description: Skip platform webhook callback (recommended for branch test)
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   renew:
@@ -33,7 +48,12 @@ jobs:
     - name: Start Proxy (sing-box)
       env:
         PROXY_URL: ${{ secrets.PROXY_URL }}
+        USE_PROXY: ${{ github.event.inputs.use_proxy }}
       run: |
+        if [ "$USE_PROXY" = "false" ]; then
+          echo "use_proxy=false, skipping sing-box setup."
+          exit 0
+        fi
         if [ -z "$PROXY_URL" ]; then
           echo "PROXY_URL not set, skipping sing-box setup."
           exit 0
@@ -45,11 +65,20 @@ jobs:
         mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
         chmod +x ./sing-box
         echo "Generating sing-box config from PROXY_URL..."
-        python proxy_handler.py
+        if ! python proxy_handler.py; then
+          echo "::warning::proxy_handler.py failed; continuing WITHOUT proxy so renew can still be tested."
+          exit 0
+        fi
         echo "Starting sing-box..."
         nohup ./sing-box run -c config.json > singbox.log 2>&1 &
         sleep 3
+        if ! curl -sS -o /dev/null --max-time 5 -x http://127.0.0.1:8080 https://www.cloudflare.com/cdn-cgi/trace; then
+          echo "::warning::sing-box local proxy probe failed; script may still try it if process is up."
+        else
+          echo "sing-box local HTTP proxy probe OK."
+        fi
         echo "sing-box started. PROXY_URL will be passed to action_renew.js."
+        head -n 40 singbox.log || true
 
     - name: Install Dependencies
       run: |
@@ -62,11 +91,12 @@ jobs:
       env:
         USERS_JSON: ${{ secrets.USERS_JSON }}
         HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
-        PROXY_URL: ${{ secrets.PROXY_URL }}
-        JOB_ID: ${{ github.event.inputs.job_id }}
-        RUN_ID: ${{ github.event.inputs.run_id }}
+        PROXY_URL: ${{ github.event.inputs.use_proxy == 'true' && secrets.PROXY_URL || '' }}
+        JOB_ID: ${{ github.event.inputs.job_id || 'katabump-renew-test' }}
+        RUN_ID: ${{ github.event.inputs.run_id || format('manual-{0}', github.run_id) }}
         CALLBACK_URL: ${{ github.event.inputs.callback_url || 'https://checkin-cron-worker.wwwqqq001.workers.dev/webhook/checkin' }}
         WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+        SKIP_WEBHOOK: ${{ github.event.inputs.skip_webhook }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
       run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
 

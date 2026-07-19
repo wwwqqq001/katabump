@@ -264,12 +264,49 @@ def parse_tuic(parsed, params):
 # Main
 # ============================================================
 
+def normalize_proxy_url(proxy_url: str) -> str:
+    """
+    Normalize common non-standard proxy URI shapes to urllib-friendly form.
+
+    Supported extra shape (seen in many proxy panels):
+      socks5://host:port:user:pass
+      http://host:port:user:pass
+    -> scheme://user:pass@host:port
+    """
+    if "://" not in proxy_url:
+        return proxy_url
+
+    scheme, rest = proxy_url.split("://", 1)
+    scheme_l = scheme.lower()
+
+    # Already standard userinfo@host form, or query-based protocols: leave as-is.
+    if "@" in rest or scheme_l in ("vmess", "vless", "hy2", "hysteria2", "tuic"):
+        return proxy_url
+
+    # host:port:user:pass  (password may contain ':', so split max 3 times from left for host/port/user)
+    # Actually password can contain ':', username usually not. Best split:
+    # host:port:user:pass... -> 4+ segments when split by ':'
+    parts = rest.split(":")
+    if scheme_l in ("socks5", "socks", "http", "https") and len(parts) >= 4:
+        host = parts[0]
+        port = parts[1]
+        user = parts[2]
+        password = ":".join(parts[3:])
+        if host and port.isdigit() and user:
+            normalized = f"{scheme_l}://{user}:{password}@{host}:{port}"
+            print("Normalized host:port:user:pass proxy URI to user:pass@host:port form")
+            return normalized
+
+    return proxy_url
+
+
 def main():
     proxy_url = os.environ.get("PROXY_URL", "").strip()
     if not proxy_url:
         print("PROXY_URL is empty, skipping sing-box config generation.")
         sys.exit(0)
 
+    proxy_url = normalize_proxy_url(proxy_url)
     scheme = proxy_url.split("://")[0].lower()
     print(f"Parsing proxy URI ({scheme}://***)")
 
@@ -279,7 +316,7 @@ def main():
         parsed = urlparse(proxy_url)
         params = parse_qs(parsed.query)
 
-        if scheme == "socks5":
+        if scheme in ("socks5", "socks"):
             outbound = parse_socks5(parsed)
         elif scheme in ("http", "https"):
             outbound = parse_http(parsed)

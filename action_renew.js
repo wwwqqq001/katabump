@@ -148,8 +148,24 @@ function buildPlatformPayload(accounts, topLevelError = null) {
 }
 
 async function sendPlatformWebhook(payload) {
+    // Test runs can skip platform callback via SKIP_WEBHOOK=1 or empty token.
+    if (process.env.SKIP_WEBHOOK === '1' || process.env.SKIP_WEBHOOK === 'true') {
+        console.log('[Webhook] SKIP_WEBHOOK set; not sending callback.');
+        console.log('[Webhook] Payload summary:', JSON.stringify({
+            status: payload.status,
+            summary: payload.data && payload.data.summary,
+            details: payload.data && payload.data.details_markdown,
+        }, null, 2));
+        return;
+    }
     if (!WEBHOOK_TOKEN) {
-        throw new Error('CONFIG_INVALID: WEBHOOK_TOKEN is required');
+        console.log('[Webhook] WEBHOOK_TOKEN empty; printing payload and continuing.');
+        console.log('[Webhook] Payload summary:', JSON.stringify({
+            status: payload.status,
+            summary: payload.data && payload.data.summary,
+            details: payload.data && payload.data.details_markdown,
+        }, null, 2));
+        return;
     }
     await axios.post(CALLBACK_URL, payload, {
         headers: {
@@ -447,20 +463,15 @@ async function waitForCloudflareSuccess(page, timeoutMs = 15000) {
     return false;
 }
 
-async function solveLoginTurnstile(page, maxAttempts = 45, maxTotalMs = 45000, successWaitMs = 8000) {
-    console.log('   >> 正在检查登录 Turnstile (使用 CDP 绕过)...');
+async function solveLoginTurnstile(page, maxAttempts = 15, maxTotalMs = 20000, successWaitMs = 10000) {
+    // Align with XCQ0607: find once, click once via CDP, wait briefly for Success, then proceed to Login.
+    // Over-retrying clicks often makes Turnstile fail harder on GitHub-hosted runners.
+    console.log('   >> 正在登录前检查 Turnstile (使用 CDP 绕过)...');
     const startedAt = Date.now();
+    let cdpClickResult = false;
     for (let findAttempt = 0; findAttempt < maxAttempts && Date.now() - startedAt < maxTotalMs; findAttempt++) {
-        const cdpClickResult = await attemptTurnstileCdp(page);
-        if (cdpClickResult) {
-            console.log('   >> 登录 CDP 点击生效。正在等待 Cloudflare 成功标志...');
-            if (await waitForCloudflareSuccess(page, successWaitMs)) {
-                console.log('   >> 登录 Turnstile 验证成功。');
-                return true;
-            }
-            console.log('   >> 未观察到 Cloudflare 成功标志，继续重试...');
-        }
-
+        cdpClickResult = await attemptTurnstileCdp(page);
+        if (cdpClickResult) break;
         try {
             const altchaStatus = await getAltchaStatus(page);
             if (altchaStatus.solved) {
@@ -468,10 +479,20 @@ async function solveLoginTurnstile(page, maxAttempts = 45, maxTotalMs = 45000, s
                 return true;
             }
         } catch (e) { }
-
         await page.waitForTimeout(1000);
     }
-    console.log(`   >> 登录 Turnstile 未检测到或未通过，用时 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒。`);
+
+    if (cdpClickResult) {
+        console.log(`   >> 登录 CDP 点击生效。正在等待最多 ${Math.ceil(successWaitMs / 1000)} 秒 Cloudflare 成功标志...`);
+        if (await waitForCloudflareSuccess(page, successWaitMs)) {
+            console.log('   >> 登录前 Turnstile 验证成功。');
+            return true;
+        }
+        console.log('   >> 未观察到 Cloudflare 成功标志，仍继续点击 Login（与 XCQ 行为一致）。');
+        return false;
+    }
+
+    console.log(`   >> 登录前未检测到或未点击 Turnstile，继续操作...（用时 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒）`);
     return false;
 }
 
@@ -880,8 +901,10 @@ async function main() {
   if (PROXY_CONFIG) {
         const isValid = await checkProxy();
         if (!isValid) {
-            console.error('[代理] 代理无效，终止运行。');
-            throw new Error('NETWORK_TIMEOUT: proxy validation failed');
+            // Soft-fail: proxy panels / GitHub egress often break outbound validation.
+            // Continue without proxy so login/renew can still be tested (XCQ path works without proxy).
+            console.error('[代理] 代理无效，本次改为直连继续（不中断测试）。');
+            PROXY_CONFIG = null;
         }
     }
 
@@ -1229,7 +1252,12 @@ async function main() {
     }
 
     const payload = buildPlatformPayload(accountResults);
-    await sendPlatformWebhook(payload);
+    try {
+        await sendPlatformWebhook(payload);
+    } catch (webhookErr) {
+        // Don't mask a successful renew with a platform callback failure (e.g. 404).
+        console.error('[Webhook] Failed to send success/result payload:', webhookErr.message);
+    }
     process.exit(payload.status === 'failed' ? 1 : 0);
   } catch (err) {
     console.error('[Fatal]', err.message || err);
